@@ -1,10 +1,9 @@
 import argparse
-import hashlib
-import io
 import json
 import os
 import struct
 import tarfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -14,7 +13,7 @@ from torchvision import transforms
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from models import VisionTransformer, vit_base, vit_small, vit_tiny
-from seal import HEADER_LEN_FMT, MAGIC, b64d, unwrap_kc_with_passphrase
+from seal import EncryptedTarStream, HEADER_LEN_FMT, MAGIC, b64d, unwrap_kc_with_passphrase
 
 
 MODEL_FACTORY = {
@@ -39,6 +38,14 @@ DEFAULT_CIFAR10_CLASSES: List[str] = [
 CLASS_NAME_TXT_CANDIDATES = ("class_names.txt", "labels.txt")
 CLASS_NAME_JSON_CANDIDATES = ("class_names.json", "labels.json")
 CHECKPOINT_EXTENSIONS = (".pth", ".pt", ".pth.tar")
+
+
+@dataclass
+class BundleArtifacts:
+    checkpoint: Optional[Dict[str, Any]]
+    checkpoint_name: Optional[str]
+    class_names: Optional[List[str]]
+    header: Dict[str, Any]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -124,11 +131,11 @@ def _resolve_content_key(
     return b64d(key_source)
 
 
-def decrypt_bundle_to_memory(
+def load_sealed_bundle(
     bundle_path: Path,
     passphrase: Optional[str],
     content_key_b64: Optional[str],
-) -> Tuple[Dict[str, bytes], Dict[str, Any]]:
+) -> BundleArtifacts:
     if not bundle_path.is_file():
         raise FileNotFoundError(f"Sealed bundle '{bundle_path}' not found.")
 
@@ -155,47 +162,68 @@ def decrypt_bundle_to_memory(
         kc = _resolve_content_key(header, passphrase, content_key_b64)
         aes = AESGCM(kc)
 
-        tar_buffer = io.BytesIO()
-        digest = hashlib.sha256()
+        stream = EncryptedTarStream(
+            handle,
+            file_size=bundle_size,
+            chunk_size=chunk_size,
+            total_chunks=total_chunks,
+            tar_sha=tar_sha,
+            aes=aes,
+        )
 
-        for idx in range(total_chunks):
-            nonce = handle.read(12)
-            if len(nonce) != 12:
-                raise ValueError("Broken sealed bundle: missing nonce.")
+        checkpoint: Optional[Dict[str, Any]] = None
+        checkpoint_name: Optional[str] = None
+        class_names: Optional[List[str]] = None
 
-            if idx < total_chunks - 1:
-                to_read = chunk_size + 16  # chunk plus GCM tag
-            else:
-                current_pos = handle.tell()
-                to_read = bundle_size - current_pos
-            ciphertext = handle.read(to_read)
-            if len(ciphertext) != to_read:
-                raise ValueError("Broken sealed bundle: truncated ciphertext.")
+        with tarfile.open(fileobj=stream, mode="r|*") as archive:
+            for member in archive:
+                if member.isdir():
+                    continue
+                if member.issym() or member.islnk():
+                    raise ValueError(f"Blocked link entry in sealed bundle: {member.name}")
 
-            aad = json.dumps({"i": idx, "n": total_chunks, "h": tar_sha}, separators=(",", ":")).encode("utf-8")
-            plaintext = aes.decrypt(nonce, ciphertext, aad)
-            tar_buffer.write(plaintext)
-            digest.update(plaintext)
+                member_path = Path(member.name)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise ValueError(f"Unsafe path '{member.name}' encountered in sealed bundle.")
+                if not member.isfile():
+                    raise ValueError(f"Unsupported tar entry type: {member.name}")
 
-    calc_sha = digest.hexdigest()
-    if calc_sha != tar_sha:
-        raise ValueError("Integrity check failed while decrypting sealed bundle.")
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
 
-    tar_buffer.seek(0)
-    files: Dict[str, bytes] = {}
-    with tarfile.open(fileobj=tar_buffer, mode="r:*") as archive:
-        for member in archive.getmembers():
-            if not member.isfile():
-                continue
-            member_path = Path(member.name)
-            if member_path.is_absolute() or ".." in member_path.parts:
-                raise ValueError(f"Unsafe path '{member.name}' encountered in sealed bundle.")
-            extracted = archive.extractfile(member)
-            if extracted is None:
-                continue
-            files[member.name] = extracted.read()
+                with extracted:
+                    lower_name = member.name.lower()
+                    if checkpoint is None and any(lower_name.endswith(ext) for ext in CHECKPOINT_EXTENSIONS):
+                        checkpoint = torch.load(extracted, map_location="cpu")
+                        checkpoint_name = member.name
+                    elif class_names is None and (
+                        lower_name in CLASS_NAME_JSON_CANDIDATES
+                        or lower_name.endswith(".json")
+                        or lower_name in CLASS_NAME_TXT_CANDIDATES
+                        or lower_name.endswith(".txt")
+                    ):
+                        data = extracted.read()
+                        parsed = _parse_class_names_json(data) if lower_name.endswith(".json") else None
+                        if parsed is None:
+                            parsed = _parse_class_names_text(data)
+                        class_names = parsed or class_names
+                    else:
+                        # Drain the file to keep the tar stream aligned.
+                        while extracted.read(1024 * 1024):
+                            pass
 
-    return files, header
+        stream.verify(tar_sha)
+
+        if checkpoint is None:
+            raise FileNotFoundError("No checkpoint (.pth/.pt) found in sealed bundle.")
+
+        return BundleArtifacts(
+            checkpoint=checkpoint,
+            checkpoint_name=checkpoint_name,
+            class_names=class_names,
+            header=header,
+        )
 
 
 def _parse_class_names_text(data: bytes) -> Optional[List[str]]:
@@ -216,53 +244,6 @@ def _parse_class_names_json(data: bytes) -> Optional[List[str]]:
         names = [str(item).strip() for item in payload if str(item).strip()]
         return names or None
     return None
-
-
-def class_names_from_bundle(files: Dict[str, bytes]) -> Optional[List[str]]:
-    for candidate in CLASS_NAME_JSON_CANDIDATES:
-        if candidate in files:
-            parsed = _parse_class_names_json(files[candidate])
-            if parsed:
-                return parsed
-
-    for candidate in CLASS_NAME_TXT_CANDIDATES:
-        if candidate in files:
-            parsed = _parse_class_names_text(files[candidate])
-            if parsed:
-                return parsed
-
-    for name, data in files.items():
-        if name.endswith(".json"):
-            parsed = _parse_class_names_json(data)
-            if parsed:
-                return parsed
-    for name, data in files.items():
-        if name.endswith(".txt"):
-            parsed = _parse_class_names_text(data)
-            if parsed:
-                return parsed
-    return None
-
-
-def load_checkpoint_from_bundle(
-    files: Dict[str, bytes],
-    model: VisionTransformer,
-    *,
-    quiet: bool,
-) -> Dict[str, Any]:
-    candidates = sorted(
-        [name for name in files.keys() if name.endswith(CHECKPOINT_EXTENSIONS)],
-        key=lambda item: item,
-    )
-    for name in candidates:
-        buffer = io.BytesIO(files[name])
-        checkpoint = torch.load(buffer, map_location="cpu")
-        state_dict = checkpoint.get("model", checkpoint)
-        model.load_state_dict(state_dict)
-        if not quiet:
-            print(f"Loaded checkpoint '{name}' from sealed bundle.")
-        return checkpoint
-    raise FileNotFoundError("No checkpoint (.pth/.pt) found in sealed bundle.")
 
 
 def get_device(device_arg: str) -> torch.device:
@@ -313,22 +294,21 @@ def perform_inference(args: argparse.Namespace) -> Dict[str, List[Tuple[str, flo
         print(f"Using device: {device}")
 
     images = collect_images(args.inputs)
-    bundle_files: Dict[str, bytes] = {}
-    bundle_header: Optional[Dict[str, Any]] = None
+    bundle_artifacts: Optional[BundleArtifacts] = None
     if args.sealed:
-        bundle_files, bundle_header = decrypt_bundle_to_memory(
+        bundle_artifacts = load_sealed_bundle(
             Path(args.sealed),
             args.sealed_passphrase,
             args.sealed_key,
         )
         if not args.quiet:
-            created = bundle_header.get("created_at", "unknown")
+            created = bundle_artifacts.header.get("created_at", "unknown")
             print(f"Decrypted sealed bundle '{args.sealed}' (created_at={created}).")
 
     if args.class_names:
         class_names = load_class_names(args.class_names)
-    elif bundle_files:
-        class_names = class_names_from_bundle(bundle_files) or DEFAULT_CIFAR10_CLASSES
+    elif bundle_artifacts and bundle_artifacts.class_names:
+        class_names = bundle_artifacts.class_names
     else:
         class_names = load_class_names("")
 
@@ -340,8 +320,19 @@ def perform_inference(args: argparse.Namespace) -> Dict[str, List[Tuple[str, flo
             load_checkpoint(checkpoint_path, model)
         else:
             raise FileNotFoundError(f"Checkpoint '{checkpoint_path}' not found.")
-    elif bundle_files:
-        load_checkpoint_from_bundle(bundle_files, model, quiet=args.quiet)
+    elif bundle_artifacts:
+        checkpoint_obj = bundle_artifacts.checkpoint
+        if checkpoint_obj is None:
+            raise FileNotFoundError("Sealed bundle did not contain a checkpoint.")
+        state_dict = checkpoint_obj.get("model", checkpoint_obj)
+        model.load_state_dict(state_dict)
+        if not args.quiet:
+            src = bundle_artifacts.checkpoint_name or "<unknown>"
+            print(f"Loaded checkpoint '{src}' from sealed bundle.")
+        # Drop decrypted checkpoint to avoid keeping an extra plaintext copy in memory.
+        del state_dict
+        del checkpoint_obj
+        bundle_artifacts.checkpoint = None
 
     model.to(device)
     model.eval()

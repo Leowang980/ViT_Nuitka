@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import struct
 import sys
 import tarfile
@@ -231,20 +232,127 @@ def encrypt_tar_to_enc(
             out_f.write(ct)
             idx += 1
 
+class EncryptedTarStream(io.RawIOBase):
+    """Lazy reader that decrypts chunked TAR payloads on demand."""
+
+    def __init__(
+        self,
+        file_handle,
+        *,
+        file_size: int,
+        chunk_size: int,
+        total_chunks: int,
+        tar_sha: str,
+        aes: AESGCM,
+    ) -> None:
+        super().__init__()
+        self._fh = file_handle
+        self._file_size = file_size
+        self._chunk_size = chunk_size
+        self._total_chunks = total_chunks
+        self._tar_sha = tar_sha
+        self._aes = aes
+        self._buffer = bytearray()
+        self._chunk_index = 0
+        self._digest = hashlib.sha256()
+        self._finished = False
+
+    def readable(self) -> bool:
+        return True
+
+    def _aad(self, idx: int) -> bytes:
+        return json.dumps({"i": idx, "n": self._total_chunks, "h": self._tar_sha}, separators=(",", ":")).encode(
+            "utf-8"
+        )
+
+    def _fill_buffer(self) -> None:
+        if self._finished or self._chunk_index >= self._total_chunks:
+            self._finished = True
+            return
+
+        nonce = self._fh.read(12)
+        if len(nonce) != 12:
+            raise ValueError("Broken ENC: nonce missing or truncated.")
+
+        if self._chunk_index < self._total_chunks - 1:
+            to_read = self._chunk_size + 16
+        else:
+            current_pos = self._fh.tell()
+            to_read = self._file_size - current_pos
+            if to_read <= 0:
+                raise ValueError("Broken ENC: final chunk length invalid.")
+
+        ciphertext = self._fh.read(to_read)
+        if len(ciphertext) != to_read:
+            raise ValueError("Broken ENC: ciphertext truncated.")
+
+        plaintext = self._aes.decrypt(nonce, ciphertext, self._aad(self._chunk_index))
+        self._digest.update(plaintext)
+        self._buffer.extend(plaintext)
+        self._chunk_index += 1
+        if self._chunk_index >= self._total_chunks:
+            self._finished = True
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+
+        if size < 0:
+            while not self._finished:
+                self._fill_buffer()
+            data = bytes(self._buffer)
+            self._buffer.clear()
+            return data
+
+        while len(self._buffer) < size and not self._finished:
+            self._fill_buffer()
+        if len(self._buffer) == 0 and self._finished:
+            return b""
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def readinto(self, b) -> int:
+        data = self.read(len(b))
+        if not data:
+            return 0
+        b[: len(data)] = data
+        return len(data)
+
+    def verify(self, expected_sha: str) -> None:
+        while not self._finished:
+            self._fill_buffer()
+            self._buffer.clear()
+
+        if self._buffer:
+            # Tarfile should have consumed the entire stream; leftover implies malformed archive.
+            raise ValueError("Sealed bundle contains trailing data after TAR extraction.")
+        if self._chunk_index != self._total_chunks:
+            raise ValueError("Sealed bundle truncated during decryption.")
+        calc = self._digest.hexdigest()
+        if not constant_time.bytes_eq(calc.encode("ascii"), expected_sha.encode("ascii")):
+            raise ValueError("Integrity check failed: tar hash mismatch.")
+
+
 def decrypt_enc_to_dir(enc_path: str, out_dir: str, passphrase: Optional[str]):
+    bundle_size = os.path.getsize(enc_path)
     with open(enc_path, "rb") as f:
-        magic = f.read(4)
+        magic = f.read(len(MAGIC))
         if magic != MAGIC:
             raise ValueError("Invalid magic/version")
-        header_len = struct.unpack(HEADER_LEN_FMT, f.read(8))[0]
+        header_len_bytes = f.read(struct.calcsize(HEADER_LEN_FMT))
+        if len(header_len_bytes) != struct.calcsize(HEADER_LEN_FMT):
+            raise ValueError("Malformed header length")
+        header_len = struct.unpack(HEADER_LEN_FMT, header_len_bytes)[0]
         header_json = f.read(header_len)
+        if len(header_json) != header_len:
+            raise ValueError("Malformed header payload")
         header = json.loads(header_json.decode("utf-8"))
 
         chunk_size = int(header["chunk_size"])
         total_chunks = int(header["total_chunks"])
         tar_sha = header["tar_sha256"]
 
-        # Recover Kc
         if header.get("kc_wrapped"):
             if not passphrase:
                 raise ValueError("This file requires a passphrase to unwrap Kc.")
@@ -255,71 +363,60 @@ def decrypt_enc_to_dir(enc_path: str, out_dir: str, passphrase: Optional[str]):
                 header["kc_nonce"],
             )
         else:
-            # For test/development only: allow Kc to be supplied via env
             kc_b64 = os.environ.get("MODEL_SEALER_KC_B64")
             if not kc_b64:
                 raise ValueError("No wrapped Kc in header. Provide Kc via env MODEL_SEALER_KC_B64 (base64).")
             kc = b64d(kc_b64)
 
         aes = AESGCM(kc)
+        stream = EncryptedTarStream(
+            f,
+            file_size=bundle_size,
+            chunk_size=chunk_size,
+            total_chunks=total_chunks,
+            tar_sha=tar_sha,
+            aes=aes,
+        )
 
-        # stream decrypt to temp tar
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_tar:
-            tmp_tar_path = tmp_tar.name
+        os.makedirs(out_dir, exist_ok=True)
+        with tarfile.open(fileobj=stream, mode="r|*") as tf:
+            safe_extract_tar(tf, out_dir)
+        stream.verify(tar_sha)
 
-        try:
-            with open(tmp_tar_path, "wb") as tar_out:
-                for idx in range(total_chunks):
-                    nonce = f.read(12)
-                    if not nonce or len(nonce) != 12:
-                        raise ValueError("Broken ENC: nonce missing")
-                    # remaining bytes of this chunk are not length-prefixed; we must infer length:
-                    # For all chunks except last: expect chunk_size + 16 tag bytes
-                    # For last: <= chunk_size + 16
-                    # Simpler approach: read next nonce position to detect boundary is non-trivial.
-                    # Instead, we read exact size for all but last.
-                    if idx < total_chunks - 1:
-                        to_read = chunk_size + 16  # tag size
-                    else:
-                        # last chunk: read the rest of the file
-                        # (file size - current_pos) gives remaining; but we cannot easily get it from stream.
-                        # So we compute filesize first.
-                        current_pos = f.tell()
-                        f.seek(0, os.SEEK_END)
-                        end_pos = f.tell()
-                        f.seek(current_pos, os.SEEK_SET)
-                        to_read = end_pos - current_pos
-                    ct = f.read(to_read)
-                    if len(ct) != to_read:
-                        raise ValueError("Broken ENC: chunk truncated")
 
-                    aad = json.dumps({"i": idx, "n": total_chunks, "h": tar_sha}, separators=(",", ":")).encode("utf-8")
-                    pt = aes.decrypt(nonce, ct, aad)
-                    tar_out.write(pt)
+def _validate_member_path(base_dir: str, member_name: str) -> str:
+    dest_path = os.path.abspath(os.path.join(base_dir, member_name))
+    base_dir_abs = os.path.abspath(base_dir)
+    if not dest_path.startswith(base_dir_abs + os.sep) and dest_path != base_dir_abs:
+        raise ValueError(f"Blocked path traversal in tar member: {member_name}")
+    return dest_path
 
-            # verify tar sha
-            with open(tmp_tar_path, "rb") as tfp:
-                calc = sha256_file(tfp)
-            if not constant_time.bytes_eq(calc.encode("ascii"), tar_sha.encode("ascii")):
-                raise ValueError("Integrity check failed: tar hash mismatch")
-
-            # extract tar safely
-            os.makedirs(out_dir, exist_ok=True)
-            with tarfile.open(tmp_tar_path, "r") as tf:
-                safe_extract_tar(tf, out_dir)
-        finally:
-            try:
-                os.unlink(tmp_tar_path)
-            except Exception:
-                pass
 
 def safe_extract_tar(tar: tarfile.TarFile, path: str):
-    # Prevent path traversal
-    for m in tar.getmembers():
-        p = os.path.abspath(os.path.join(path, m.name))
-        if not p.startswith(os.path.abspath(path) + os.sep) and p != os.path.abspath(path):
-            raise Exception("Blocked path traversal in tar member: " + m.name)
-    tar.extractall(path=path)
+    for member in tar:
+        if member.issym() or member.islnk():
+            raise ValueError(f"Blocked link entry in tar member: {member.name}")
+
+        dest_path = _validate_member_path(path, member.name)
+
+        if member.isdir():
+            os.makedirs(dest_path, exist_ok=True)
+            continue
+        if not member.isfile():
+            raise ValueError(f"Unsupported tar entry type for member: {member.name}")
+
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        extracted = tar.extractfile(member)
+        if extracted is None:
+            raise ValueError(f"Failed to read member: {member.name}")
+        with extracted:
+            with open(dest_path, "wb") as out_f:
+                shutil.copyfileobj(extracted, out_f)
+        if member.mode is not None:
+            try:
+                os.chmod(dest_path, member.mode)
+            except OSError:
+                pass
 
 # ---------- CLI ----------
 
