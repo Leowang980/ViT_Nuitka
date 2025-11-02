@@ -3,10 +3,12 @@ from typing import Any, Dict, List, Sequence, Tuple, Union
 
 from deploy import build_parser as build_deploy_parser
 from deploy import perform_inference
+from encrypt import build_parser as build_encrypt_parser
+from encrypt import perform_encryption
 from train import build_parser as build_train_parser
 from train import run_training
 
-__all__ = ["train_vit", "infer_vit"]
+__all__ = ["train_vit", "infer_vit", "encrypt"]
 
 
 def _namespace_from_parser(
@@ -50,3 +52,19 @@ def infer_vit(
     options.setdefault("quiet", True)
     args = _namespace_from_parser(parser, positional, options)
     return perform_inference(args)
+
+
+def encrypt(
+    inputs: Union[str, Path, Sequence[Union[str, Path]]],
+    **options,
+) -> Dict[str, Any]:
+    """Encrypt one or more files into a sealed bundle."""
+    options = dict(options)
+    if isinstance(inputs, (str, Path)):
+        positional = [str(inputs)]
+    else:
+        positional = [str(item) for item in inputs]
+
+    parser = build_encrypt_parser()
+    args = _namespace_from_parser(parser, positional, options)
+    return perform_encryption(args)

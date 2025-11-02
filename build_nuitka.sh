@@ -13,6 +13,7 @@ python -m nuitka \
   --module api.py \
   --include-module=train \
   --include-module=deploy \
+  --include-module=encrypt \
   --include-package=models \
   --output-dir="$OUTPUT_DIR" \
   "$@"

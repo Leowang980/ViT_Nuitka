@@ -45,10 +45,31 @@
 ### 2.2 暴露的 API
 - `train_vit(**options) -> float`：执行完整训练流程，返回验证集最佳准确率。
 - `infer_vit(inputs, **options) -> Dict[str, List[Tuple[str, float]]]`：对图像执行推理，返回每张图像的 Top-k 预测结果。
+- `encrypt(inputs, **options) -> Dict[str, Any]`：将一个或多个文件打包为加密的 `.enc` 密封包，返回包含输出路径、内容密钥等信息的字典。
 
 其余实现均已封装在二进制中，无法直接访问源代码。
 
-### 2.3 训练示例
+### 2.3 加密示例
+```python
+import api
+
+meta = api.encrypt(
+    ["outputs/best.pth", "class_names.txt"],
+    out="dist/model_bundle.enc",
+    passphrase="keep-me-safe",  # 可选：未提供时需要妥善保存 content_key_b64。
+    chunk_size_mb=32,           # 可选：默认 64。
+)
+print(meta["output"], meta["content_key_b64"])
+```
+
+命令行等价调用：
+```bash
+python encrypt.py --out dist/model_bundle.enc outputs/best.pth class_names.txt --passphrase keep-me-safe
+```
+
+未设定口令时，可在推理阶段通过 `--sealed-key` 或环境变量 `MODEL_SEALER_KC_B64` 提供内容密钥。
+
+### 2.4 训练示例
 ```python
 import api
 
@@ -69,13 +90,14 @@ print(f"Best validation accuracy: {best_acc * 100:.2f}%")
 - `device`：计算设备（如 `"cuda"`、`"cpu"`、`"mps"`），默认自动选择。
 - `resume`：恢复训练使用的 checkpoint 路径。
 
-### 2.4 推理示例
+### 2.5 推理示例
 ```python
 import api
 
 results = api.infer_vit(
     ["examples/dog.png", "examples/cat.jpg"],
-    checkpoint="outputs/best.pth",
+    sealed="dist/model_bundle.enc",
+    sealed_passphrase="keep-me-safe",  # 或 sealed_key="base64-of-content-key"
     model="vit_small",
     image_size=224,
     topk=3,
@@ -91,9 +113,16 @@ for path, predictions in results.items():
 - `class_names`：包含类别名称的文本文件路径（每行一个类），默认使用内置的 CIFAR10 标签。
 - `amp`：在 CUDA 上启用混合精度推理。
 - `quiet`：默认为 `True`，如需打印详细信息可设为 `False`。
+- `sealed` / `sealed_passphrase` / `sealed_key`：用于加载加密模型包，解密过程全程在内存中完成，不会生成明文 TAR 或 checkpoint 文件。
 
-### 2.5 注意事项
+命令行示例：
+```bash
+python deploy.py ./images --sealed dist/model_bundle.enc --sealed-passphrase keep-me-safe
+```
+
+### 2.6 注意事项
 - 训练和推理均依赖 Torch 与 TorchVision，需确保版本兼容。
 - 推理未提供 `checkpoint` 时将使用随机初始化模型（仅适用于功能验证）。
 - 训练过程中会在 `output_dir` 下保存 `last.pth` 与 `best.pth` 供后续推理加载。
 - 若需重新构建或更新二进制产物，请参考「使用 Nuitka 重新编译」章节。
+- 密封包解密采用流式 AES-256-GCM，只在内存中展开 TAR 内容及模型权重，满足无明文落盘要求。
