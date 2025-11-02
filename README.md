@@ -16,9 +16,9 @@ This repository contains a Vision Transformer (ViT) training and inference stack
 ## 1. Rebuilding with Nuitka
 1. Install Nuitka if necessary:
    ```bash
-  python -m pip install nuitka
+   python -m pip install nuitka
    ```
-2. Build from the project root (outputs to `dist/` by default):
+1. Build from the project root (outputs to `dist/` by default):
    ```bash
    bash build_nuitka.sh
    ```
@@ -26,7 +26,7 @@ This repository contains a Vision Transformer (ViT) training and inference stack
    ```bash
    bash build_nuitka.sh dist --onefile
    ```
-3. The compiled module exports `train_vit`, `infer_vit`, and `encrypt`. Example usage (assuming the binary is emitted as `dist/api.so`):
+2. The compiled module exports `train_vit`, `infer_vit`, and `encrypt`. Example usage (assuming the binary is emitted as `dist/api.so`):
    ```python
    import api
 
@@ -34,7 +34,7 @@ This repository contains a Vision Transformer (ViT) training and inference stack
    results = api.infer_vit("tests/image.png", checkpoint="outputs/best.pth")
    meta = api.encrypt(["outputs/best.pth"], out="dist/model_bundle.enc")
    ```
-4. Distribute only the contents of `dist/` alongside the runtime dependencies.
+3. Distribute only the contents of `dist/` alongside the runtime dependencies.
 
 ---
 
