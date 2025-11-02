@@ -1,4 +1,5 @@
 import argparse
+import io
 import json
 import os
 import struct
@@ -195,8 +196,15 @@ def load_sealed_bundle(
                 with extracted:
                     lower_name = member.name.lower()
                     if checkpoint is None and any(lower_name.endswith(ext) for ext in CHECKPOINT_EXTENSIONS):
-                        checkpoint = torch.load(extracted, map_location="cpu")
+                        # torch.load requires a seekable file-like object, so we need to
+                        # read the stream into memory first
+                        checkpoint_data = extracted.read()
+                        checkpoint = torch.load(io.BytesIO(checkpoint_data), map_location="cpu")
                         checkpoint_name = member.name
+                        # Release the raw bytes data immediately after loading
+                        # (torch.load has already deserialized it into Python objects,
+                        # and the BytesIO object will be garbage collected automatically)
+                        del checkpoint_data
                     elif class_names is None and (
                         lower_name in CLASS_NAME_JSON_CANDIDATES
                         or lower_name.endswith(".json")

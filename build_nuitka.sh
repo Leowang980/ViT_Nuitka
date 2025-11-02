@@ -15,6 +15,7 @@ python -m nuitka \
   --include-module=deploy \
   --include-module=encrypt \
   --include-package=models \
+  --include-package=seal \
   --output-dir="$OUTPUT_DIR" \
   "$@"
 

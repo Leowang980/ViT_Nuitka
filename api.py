@@ -16,13 +16,26 @@ def _namespace_from_parser(
     positional: Sequence[str],
     overrides: Dict[str, Any],
 ):
-    args = parser.parse_args(list(positional))
+    # Convert overrides to command-line arguments
+    # Need to map Python attribute names (with underscores) to CLI option names (with hyphens)
+    cmd_args = list(positional)
     for key, value in overrides.items():
-        if not hasattr(args, key):
-            raise ValueError(f"Unknown option '{key}' for parser.")
         if isinstance(value, Path):
             value = str(value)
-        setattr(args, key, value)
+        if value is None:
+            continue
+        
+        # Convert underscore to hyphen for command-line arguments
+        # (argparse converts hyphens to underscores for attribute names)
+        cli_key = key.replace("_", "-")
+        
+        if isinstance(value, bool):
+            if value:
+                cmd_args.append(f"--{cli_key}")
+        else:
+            cmd_args.extend([f"--{cli_key}", str(value)])
+    
+    args = parser.parse_args(cmd_args)
     return args
 
 
