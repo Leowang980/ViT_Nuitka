@@ -12,4 +12,5 @@ outputs/
 # Misc
 .DS_Store
 
+test.py
 keygen.md

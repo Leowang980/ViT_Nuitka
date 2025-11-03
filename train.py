@@ -296,9 +296,9 @@ def run_training(args: argparse.Namespace) -> float:
     criterion = nn.CrossEntropyLoss()
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = LambdaLR(optimizer, lr_lambda=cosine_with_warmup_schedule(args.epochs, args.warmup_epochs))
-    scaler: Optional[torch.amp.GradScaler] = None
+    scaler: Optional[torch.cuda.amp.GradScaler] = None
     if device.type == "cuda" and args.amp:
-        scaler = torch.amp.GradScaler(device_type="cuda")
+        scaler = torch.cuda.amp.GradScaler()
 
     start_epoch = 0
     best_acc = 0.0
