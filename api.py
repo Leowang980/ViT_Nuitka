@@ -62,7 +62,7 @@ def infer_vit(
         positional = [str(item) for item in inputs]
 
     parser = build_deploy_parser()
-    options.setdefault("quiet", True)
+    
     args = _namespace_from_parser(parser, positional, options)
     return perform_inference(args)
 

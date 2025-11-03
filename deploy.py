@@ -130,35 +130,34 @@ def _keygen_request(
         raise KeygenError(f"Unable to reach Keygen API: {exc.reason}") from exc
 
 
-def _keygen_validate_license(license_key: str) -> Dict[str, Any]:
+def _keygen_validate_license(license_key: str, fingerprint: str, machine_name: str, platform_name: str, activation_token: str) -> Dict[str, Any]:
     response = _keygen_request(
         "POST",
         f"/v1/accounts/{_resolve_keygen_account_id()}/licenses/actions/validate-key",
-        payload={"meta": {"key": license_key}},
+        payload={"meta": 
+            {
+                "key": license_key,
+                "scope":{
+                "fingerprint": fingerprint
+                }
+            }
+        },
     )
+    #print(response)
     meta = response.get("meta", {})
     if meta and not meta.get("valid", True):
-        detail = meta.get("detail") or "License key is not valid."
-        raise KeygenError(detail)
+        if meta.get("code") == "NO_MACHINES":
+            license_id = response.get("data", {}).get("id")
+            _keygen_activate_machine(license_key, license_id, fingerprint, machine_name, platform_name, activation_token)
+        elif meta.get("code") == "FINGERPRINT_SCOPE_MISMATCH":
+            raise KeygenError("License key is already activated on another machine.")
+        else:
+            detail = meta.get("detail") or "License key is not valid."
+            raise KeygenError(detail)
     data = response.get("data")
     if not data:
         raise KeygenError("Keygen did not return license data for the supplied key.")
     return data
-
-
-def _keygen_list_license_machines(license_key: str, license_id: str) -> List[Dict[str, Any]]:
-    account_id = _resolve_keygen_account_id()
-    encoded_license = urllib.parse.quote(license_id, safe="")
-    response = _keygen_request(
-        "GET",
-        f"/v1/accounts/{account_id}/machines?filter[license]={encoded_license}",
-        headers={"Authorization": f"License {license_key}"},
-    )
-    data = response.get("data", [])
-    if not isinstance(data, list):
-        return []
-    return data
-
 
 def _keygen_activate_machine(
     license_key: str,
@@ -166,8 +165,20 @@ def _keygen_activate_machine(
     fingerprint: str,
     machine_name: str,
     platform_name: str,
+    activation_token: str,
+    quiet: bool = False,
 ) -> None:
     account_id = _resolve_keygen_account_id()
+    # Simple interaction: confirm whether to activate this device
+    try:
+        choice = input(f"Activate this device ({fingerprint}) on {machine_name} ({platform_name})? ([y/N]: ").strip().lower()
+    except EOFError:
+        choice = ""
+    if choice not in ("y", "yes", "1"):
+        if not quiet:
+            print("Device activation canceled.")
+        return
+
     payload = {
         "data": {
             "type": "machines",
@@ -183,52 +194,29 @@ def _keygen_activate_machine(
             },
         }
     }
-    _keygen_request(
+
+    response = _keygen_request(
         "POST",
         f"/v1/accounts/{account_id}/machines",
-        headers={"Authorization": f"License {license_key}"},
+        headers={"Authorization": f"Bearer {activation_token}"},
         payload=payload,
     )
+    #print("activate machine response:", response)
+    if not quiet:
+        print(f"Activated Keygen license for machine '{machine_name}' ({fingerprint}).")
 
 
-def ensure_keygen_activation(license_key: str, quiet: bool) -> None:
+def ensure_keygen_activation(license_key: str, activation_token: str, quiet: bool) -> None:
     fingerprint = _resolve_machine_fingerprint()
     machine_name = platform.node() or "unknown-machine"
     platform_name = platform.platform()
 
-    license_data = _keygen_validate_license(license_key)
+    license_data = _keygen_validate_license(license_key, fingerprint, machine_name, platform_name, activation_token)
     license_id = license_data.get("id")
     if not license_id:
         raise KeygenError("Keygen license response was missing an identifier.")
 
-    machines = _keygen_list_license_machines(license_key, license_id)
-    matching_machine: Optional[Dict[str, Any]] = None
-    for machine in machines:
-        attributes = machine.get("attributes") or {}
-        if attributes.get("fingerprint") == fingerprint:
-            matching_machine = machine
-            break
-
-    if matching_machine:
-        if not quiet:
-            print(f"Validated Keygen license for fingerprint {fingerprint}.")
-        return
-
-    if machines:
-        existing_fingerprints = sorted(
-            filter(
-                None,
-                [(machine.get("attributes") or {}).get("fingerprint") for machine in machines],
-            )
-        )
-        raise KeygenError(
-            "License key is already activated on another machine."
-            + (f" Existing activations: {', '.join(existing_fingerprints)}" if existing_fingerprints else "")
-        )
-
-    _keygen_activate_machine(license_key, license_id, fingerprint, machine_name, platform_name)
-    if not quiet:
-        print(f"Activated Keygen license for machine '{machine_name}' ({fingerprint}).")
+    
 
 
 @dataclass
@@ -269,6 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="auto", help="Torch device string or 'auto'.")
     parser.add_argument("--topk", type=int, default=5, help="Number of top predictions to display.")
     parser.add_argument("--amp", action="store_true", help="Enable AMP during inference on CUDA.")
+    parser.add_argument("--activation-token", type=str, default="", help="Keygen activation token.")
     parser.add_argument("--quiet", action="store_true", help="Suppress console output and only return results.")
     return parser
 
@@ -507,7 +496,8 @@ def perform_inference(args: argparse.Namespace) -> Dict[str, List[Tuple[str, flo
                 "Provide --license-key or set KEYGEN_LICENSE_KEY."
             )
         try:
-            ensure_keygen_activation(license_key, quiet=args.quiet)
+            ensure_keygen_activation(license_key, args.activation_token, quiet=args.quiet)
+            print("✅ Keygen license validated successfully.")
         except KeygenError as exc:
             raise ValueError(f"Keygen license validation failed: {exc}") from exc
         bundle_artifacts = load_sealed_bundle(
