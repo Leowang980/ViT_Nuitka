@@ -103,6 +103,7 @@ results = api.infer_vit(
     ["examples/dog.png", "examples/cat.jpg"],
     sealed="dist/model_bundle.enc",
     sealed_passphrase="keep-me-safe",  # or sealed_key="base64-of-content-key"
+    license_key="key-00000000000000000000000000000000",
     model="vit_small",
     image_size=224,
     topk=3,
@@ -116,7 +117,7 @@ for path, predictions in results.items():
 
 Command-line usage:
 ```bash
-python deploy.py ./images --sealed dist/model_bundle.enc --sealed-passphrase keep-me-safe
+python deploy.py ./images --sealed dist/model_bundle.enc --sealed-passphrase keep-me-safe --license-key key-00000000000000000000000000000000
 ```
 
 Useful options:
@@ -124,6 +125,14 @@ Useful options:
 - `amp`: enable mixed-precision inference on CUDA.
 - `quiet`: suppress console output (default `True`).
 - `sealed` / `sealed_passphrase` / `sealed_key`: load encrypted bundles without touching disk with plaintext files.
+- `license_key`: required when `--sealed` is used to authorize the current machine via Keygen.
+
+Set the following environment variables before running inference with sealed bundles:
+
+- `KEYGEN_ACCOUNT_ID`: your Keygen account identifier (required).
+- `KEYGEN_LICENSE_KEY`: optional default license key if `--license-key` is not passed.
+- `KEYGEN_BASE_URL`: optional override for self-hosted deployments (defaults to `https://api.keygen.sh`).
+- `KEYGEN_MACHINE_FINGERPRINT`: optional override for deterministic fingerprints (otherwise the host details are hashed).
 
 ### 2.6 Security Notes
 - AES-256-GCM is used for chunked encryption. Decryption streams chunks directly into memory; plaintext TAR data and checkpoints are never written to disk.

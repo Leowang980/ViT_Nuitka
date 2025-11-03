@@ -1,8 +1,14 @@
 import argparse
+import hashlib
 import json
 import os
+import platform
 import struct
 import tarfile
+import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -38,6 +44,190 @@ DEFAULT_CIFAR10_CLASSES: List[str] = [
 CLASS_NAME_TXT_CANDIDATES = ("class_names.txt", "labels.txt")
 CLASS_NAME_JSON_CANDIDATES = ("class_names.json", "labels.json")
 CHECKPOINT_EXTENSIONS = (".pth", ".pt", ".pth.tar")
+KEYGEN_DEFAULT_BASE_URL = "https://api.keygen.sh"
+KEYGEN_ACCOUNT_ENV_VARS = ("KEYGEN_ACCOUNT_ID", "KEYGEN_ACCOUNT")
+KEYGEN_TIMEOUT = 10
+
+
+class KeygenError(RuntimeError):
+    """Raised when Keygen license validation fails."""
+
+
+def _resolve_keygen_account_id() -> str:
+    for env_name in KEYGEN_ACCOUNT_ENV_VARS:
+        value = os.environ.get(env_name)
+        if value:
+            return value
+    raise KeygenError(
+        "Keygen account identifier is not configured. Set KEYGEN_ACCOUNT_ID (or KEYGEN_ACCOUNT)."
+    )
+
+
+def _resolve_machine_fingerprint() -> str:
+    override = os.environ.get("KEYGEN_MACHINE_FINGERPRINT")
+    if override:
+        return override
+
+    components = [
+        platform.system(),
+        platform.node(),
+        platform.machine(),
+        str(uuid.getnode()),
+    ]
+    data = "|".join(part for part in components if part).encode("utf-8")
+    digest = hashlib.sha256(data).hexdigest()
+    return ":".join(digest[i : i + 2] for i in range(0, len(digest), 2))
+
+
+def _keygen_user_agent() -> str:
+    return os.environ.get("KEYGEN_USER_AGENT", "CrypDeploy/1.0")
+
+
+def _keygen_base_url() -> str:
+    return os.environ.get("KEYGEN_BASE_URL", KEYGEN_DEFAULT_BASE_URL).rstrip("/")
+
+
+def _keygen_request(
+    method: str,
+    path: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    url = f"{_keygen_base_url()}{path}"
+    request_headers = {
+        "Accept": "application/vnd.api+json",
+        "User-Agent": _keygen_user_agent(),
+    }
+    data: Optional[bytes] = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        request_headers["Content-Type"] = "application/vnd.api+json"
+    if headers:
+        request_headers.update(headers)
+
+    req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=KEYGEN_TIMEOUT) as response:
+            body = response.read()
+            if not body:
+                return {}
+            return json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.reason
+        try:
+            error_body = exc.read()
+            if error_body:
+                parsed = json.loads(error_body.decode("utf-8"))
+                errors = parsed.get("errors") or []
+                if errors and isinstance(errors, list):
+                    detail = errors[0].get("detail", detail)
+        except Exception:
+            pass
+        raise KeygenError(f"Keygen API request failed ({exc.code}): {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise KeygenError(f"Unable to reach Keygen API: {exc.reason}") from exc
+
+
+def _keygen_validate_license(license_key: str) -> Dict[str, Any]:
+    response = _keygen_request(
+        "POST",
+        f"/v1/accounts/{_resolve_keygen_account_id()}/licenses/actions/validate-key",
+        payload={"meta": {"key": license_key}},
+    )
+    meta = response.get("meta", {})
+    if meta and not meta.get("valid", True):
+        detail = meta.get("detail") or "License key is not valid."
+        raise KeygenError(detail)
+    data = response.get("data")
+    if not data:
+        raise KeygenError("Keygen did not return license data for the supplied key.")
+    return data
+
+
+def _keygen_list_license_machines(license_key: str, license_id: str) -> List[Dict[str, Any]]:
+    account_id = _resolve_keygen_account_id()
+    encoded_license = urllib.parse.quote(license_id, safe="")
+    response = _keygen_request(
+        "GET",
+        f"/v1/accounts/{account_id}/machines?filter[license]={encoded_license}",
+        headers={"Authorization": f"License {license_key}"},
+    )
+    data = response.get("data", [])
+    if not isinstance(data, list):
+        return []
+    return data
+
+
+def _keygen_activate_machine(
+    license_key: str,
+    license_id: str,
+    fingerprint: str,
+    machine_name: str,
+    platform_name: str,
+) -> None:
+    account_id = _resolve_keygen_account_id()
+    payload = {
+        "data": {
+            "type": "machines",
+            "attributes": {
+                "fingerprint": fingerprint,
+                "platform": platform_name,
+                "name": machine_name,
+            },
+            "relationships": {
+                "license": {
+                    "data": {"type": "licenses", "id": license_id},
+                }
+            },
+        }
+    }
+    _keygen_request(
+        "POST",
+        f"/v1/accounts/{account_id}/machines",
+        headers={"Authorization": f"License {license_key}"},
+        payload=payload,
+    )
+
+
+def ensure_keygen_activation(license_key: str, quiet: bool) -> None:
+    fingerprint = _resolve_machine_fingerprint()
+    machine_name = platform.node() or "unknown-machine"
+    platform_name = platform.platform()
+
+    license_data = _keygen_validate_license(license_key)
+    license_id = license_data.get("id")
+    if not license_id:
+        raise KeygenError("Keygen license response was missing an identifier.")
+
+    machines = _keygen_list_license_machines(license_key, license_id)
+    matching_machine: Optional[Dict[str, Any]] = None
+    for machine in machines:
+        attributes = machine.get("attributes") or {}
+        if attributes.get("fingerprint") == fingerprint:
+            matching_machine = machine
+            break
+
+    if matching_machine:
+        if not quiet:
+            print(f"Validated Keygen license for fingerprint {fingerprint}.")
+        return
+
+    if machines:
+        existing_fingerprints = sorted(
+            filter(
+                None,
+                [(machine.get("attributes") or {}).get("fingerprint") for machine in machines],
+            )
+        )
+        raise KeygenError(
+            "License key is already activated on another machine."
+            + (f" Existing activations: {', '.join(existing_fingerprints)}" if existing_fingerprints else "")
+        )
+
+    _keygen_activate_machine(license_key, license_id, fingerprint, machine_name, platform_name)
+    if not quiet:
+        print(f"Activated Keygen license for machine '{machine_name}' ({fingerprint}).")
 
 
 @dataclass
@@ -64,6 +254,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Base64 content key for sealed bundles without a passphrase (falls back to MODEL_SEALER_KC_B64).",
+    )
+    parser.add_argument(
+        "--license-key",
+        type=str,
+        default="",
+        help="Keygen license key used to authorize sealed bundle decryption (falls back to KEYGEN_LICENSE_KEY).",
     )
     parser.add_argument("--model", type=str, default="vit_tiny", choices=MODEL_FACTORY.keys(), help="Model variant.")
     parser.add_argument("--image-size", type=int, default=224, help="Input resolution expected by the model.")
@@ -296,6 +492,16 @@ def perform_inference(args: argparse.Namespace) -> Dict[str, List[Tuple[str, flo
     images = collect_images(args.inputs)
     bundle_artifacts: Optional[BundleArtifacts] = None
     if args.sealed:
+        license_key = args.license_key or os.environ.get("KEYGEN_LICENSE_KEY", "")
+        if not license_key:
+            raise ValueError(
+                "A Keygen license key is required when using --sealed. "
+                "Provide --license-key or set KEYGEN_LICENSE_KEY."
+            )
+        try:
+            ensure_keygen_activation(license_key, quiet=args.quiet)
+        except KeygenError as exc:
+            raise ValueError(f"Keygen license validation failed: {exc}") from exc
         bundle_artifacts = load_sealed_bundle(
             Path(args.sealed),
             args.sealed_passphrase,
